@@ -1,0 +1,482 @@
+```{r}
+library(pacman)
+p_load(tidyverse, readxl, stringr, forcats, lubridate) #General
+p_load(sf, maps, ggmap) #Maps
+p_load(ggspatial, scatterpie, ggforce, ggnewscale, ggrepel, ggforce, cowplot, colorspace, plotly, ggridges, ggdist, ggpmisc) #Graphics
+p_load(flextable, tableone, officer) #Tables
+```
+
+```{r}
+#Get US-Mexico international border
+US.mex.border <- rgdal::readOGR(
+  "Border_SHP/Mexico_and_US_Border.shp")
+US.mex.border <- smoothr::densify(US.mex.border, n = 10)
+US.mex.border <- fortify(US.mex.border)
+
+#Import map file
+mxl.shp <- st_read("Mexicali_SHP/lim_col20_au25.shp")
+mxl.shp <- st_transform(mxl.shp, crs = 4326)
+
+#Import main data file
+df <- read.csv("REGISTRO DE AUXILIO SOBREDOSIS_210623.csv")
+
+#Clean up dataset
+df <- df %>% mutate(FECHA_INCIDENTE = ifelse(FECHA_INCIDENTE == "#NULL!", as.character(FECHA), as.character(FECHA_INCIDENTE)))
+df <- df %>% mutate(FECHA = ifelse(FECHA == "#NULL!", as.character(FECHA_INCIDENTE), as.character(FECHA)))
+#Convert dates from epoch/SPSS
+df$FECHA <- dmy(df$FECHA)
+df$FECHA_INCIDENTE <- dmy(df$FECHA_INCIDENTE)
+df <- df %>% mutate(Age = as.numeric(as.character(EDAD)))
+df <- df %>% mutate(Age = ifelse(Age < 16, NA, Age))
+df <- df %>% mutate(Gender = factor(`G.âNERO`, levels = c("Femenino", "Masculino", "Transgénero")))
+df <- df %>% mutate(Gender = case_when(
+                      `G.âNERO` == "Femenino" ~ "Female", 
+                      `G.âNERO` == "Masculino" ~ "Male", 
+                      `G.âNERO` == "Transgénero" ~ "Transgender"))
+df <- df %>% mutate(
+  `Product applied` = case_when(PRODUCTO == "Naloxona (Inyección)" ~ "Naloxone, injection",
+                                PRODUCTO == "Naloxona y Narcan" ~ "Both",
+                                PRODUCTO == "Narcan (Nasal)" ~ "Naloxone, intranasal",
+                                PRODUCTO == "Ninguno" ~ "None",
+                                is.na(PRODUCTO) ~ "None"))
+df$`Product applied` <- replace_na(df$`Product applied`, "None")
+df <- df %>% mutate(`Naloxone doses` = as.numeric(as.character(DOSIS)))
+df <- df %>% mutate(`APLICACI.ìN_NALOXONA` = ifelse(`Naloxone doses` > 0, "Si", `APLICACI.ìN_NALOXONA`))
+df <- df %>% mutate(`APLICACI.ìN_NALOXONA` = ifelse(PRODUCTO == "Naloxona (Inyección)", "Si", `APLICACI.ìN_NALOXONA`))
+df <- df %>% mutate(`APLICACI.ìN_NALOXONA` = ifelse(PRODUCTO == "Naloxona y Narcan", "Si", `APLICACI.ìN_NALOXONA`))
+df <- df %>% mutate(`APLICACI.ìN_NALOXONA` = ifelse(PRODUCTO == "Narcan (Nasal)", "Si", `APLICACI.ìN_NALOXONA`))
+df <- df %>% mutate(`APLICACI.ìN_NALOXONA` = ifelse(PRODUCTO == "Ninguno", "No", `APLICACI.ìN_NALOXONA`))
+df <- df %>% mutate(`APLICACI.ìN_NALOXONA` = ifelse(PRODUCTO == "", "No", `APLICACI.ìN_NALOXONA`))
+df <- df %>% mutate(`Naloxone applied` = case_when(`APLICACI.ìN_NALOXONA` == "No" ~ "No",
+                                                   `APLICACI.ìN_NALOXONA` == "Si" ~ "Yes",
+                                                   `APLICACI.ìN_NALOXONA` == "Sí" ~ "Yes"
+                                                   ))
+
+#Convert to uppercase and align with shape file
+df <- df %>% mutate(COLONIAS = toupper(COLONIA))
+df$COLONIAS <- stringi::stri_trans_general(df$COLONIAS, id = "Latin-ASCII")
+df$COLONIAS <- as.character(df$COLONIAS)
+df <- df %>% mutate(COLONIAS = if_else(COLONIAS == "ZONA CENTRO", "PRIMERA SECCION", COLONIAS))
+df <- df %>% mutate(COLONIAS = if_else(COLONIAS == "PASADENA", "BARRIO PASADINA", COLONIAS))
+df <- df %>% mutate(COLONIAS = if_else(COLONIAS == "BELLAVISTA", "BELLA VISTA", COLONIAS))
+df <- df %>% mutate(COLONIAS = if_else(COLONIAS == "ANGELES DE PUEBLA", "FRACC. ANGELES DE PUEBLA", COLONIAS))
+df <- df %>% mutate(COLONIAS = if_else(COLONIAS == "CARRANZA", "VENUSTIANO CARRANZA", COLONIAS))
+df <- df %>% mutate(COLONIAS = if_else(COLONIAS == "COLONIA NUEVA", "NUEVA", COLONIAS))
+df <- df %>% mutate(COLONIAS = if_else(COLONIAS == "CONJUNTO URBANO UNIVERSITARIO", "CONJ. URB. UNIVERSITARIO", COLONIAS))
+df <- df %>% mutate(COLONIAS = if_else(COLONIAS == "CUAUHTEMOC", "CUAUHTEMOC SUR", COLONIAS))
+df <- df %>% mutate(COLONIAS = if_else(COLONIAS == "HACIENDA DEL BOSQUE", "FRACC. HACIENDA DEL BOSQUE", COLONIAS))
+df <- df %>% mutate(COLONIAS = if_else(COLONIAS == "MEXICALI", "FRACC.  MEXICALI", COLONIAS))
+df <- df %>% mutate(COLONIAS = if_else(COLONIAS == "NACOZARI", "HEROE DE NACOZARI", COLONIAS))
+
+df.sum <- df %>% group_by(COLONIAS) %>% summarize(n = n())
+mxl.colonias <- mxl.shp %>% group_by(COLONIAS) %>% summarise(n())
+
+#Clean up substances
+df$SUSTANCIA <- stringi::stri_trans_general(df$SUSTANCIA, id = "Latin-ASCII")
+df <- df %>% mutate(Substance = case_when(
+  SUSTANCIA == "" ~ "Unknown",
+  SUSTANCIA == "Alcohol" ~ "Alcohol",                                     
+  SUSTANCIA == "Cerveza" ~ "Alcohol",
+  SUSTANCIA == "Cristal con heroina" ~ "Methamphetamine and heroin",                      
+  SUSTANCIA ==  "Fentanilo" ~ "Fentanyl",
+  SUSTANCIA == "Goma con ladrillo" ~ "Heroin",                           
+  SUSTANCIA == "Heroina / Crystal / Pingas" ~ "Methamphetamine and sedatives and heroin", 
+  SUSTANCIA == "Heroina / Crystal / Pingas/ Fentanilo" ~ "Methamphetamine and sedatives and heroin and fentanyl", 
+  SUSTANCIA == "Heroina / Crystal / Pingas / Fentanilo" ~ "Methamphetamine and sedatives and heroin and fentanyl", 
+  SUSTANCIA == "Heroina goma/negra" ~ "Heroin",
+  SUSTANCIA == "Heroina negra con polvo blanco" ~ "Heroin",
+  SUSTANCIA == "Heroina negra y alcohol" ~ "Alcohol and heroin",
+  SUSTANCIA == "Heroina negra y Fentanilo" ~ "Fentanyl and heroin",
+  SUSTANCIA == "Heroina polvo/blanca" ~ "Heroin",
+  SUSTANCIA == "Heroina y Pingas/Benzos (Clonazepam, Xanax)" ~ "Sedatives and heroin",
+  SUSTANCIA == "Heroina/Pingas/Fentanilo" ~ "Sedatives and fentanyl and heroin",
+  SUSTANCIA == "Heroina, pingas y alcohol" ~ "Sedatives and alcohol and heroin",                   
+  SUSTANCIA == "No se" ~ "Unknown"    
+))
+
+df <- df %>% mutate(Substance3 = case_when(
+  Substance == "Unknown" ~ "Unknown",
+  Substance == "Alcohol" ~ "Alcohol",                                     
+  Substance == "Cerveza" ~ "Alcohol",
+  Substance == "Methamphetamine and heroin" ~ "Methamphetamine and\n heroin",                      
+  Substance ==  "Fentanyl" ~ "Fentanyl",
+  Substance == "Heroin" ~ "Heroin",                           
+  Substance == "Methamphetamine and sedatives and heroin" ~ "Methamphetamine and\n sedatives and\n heroin", 
+  Substance == "Methamphetamine and sedatives and heroin and fentanyl" ~ "Methamphetamine and\n sedatives and\n heroin and\n fentanyl",    
+  Substance == "Alcohol and heroin" ~ "Alcohol and\n heroin",
+  Substance == "Fentanyl and heroin" ~ "Fentanyl and\n heroin",
+  Substance == "Sedatives and heroin" ~ "Sedatives and\n heroin",
+  Substance == "Sedatives and fentanyl and heroin" ~ "Sedatives and\n fentanyl and\n heroin",
+  Substance == "Sedatives and alcohol and heroin" ~ "Sedatives and\n alcohol and\n heroin"
+))
+
+df <- df %>% mutate(Methamphetamine = ifelse(str_detect(Substance, regex("Methamphetamine", ignore_case = T)), "Yes", "No"))
+df <- df %>% mutate(Heroin = ifelse(str_detect(Substance, regex("Heroin", ignore_case = T)), "Yes", "No"))
+df <- df %>% mutate(Heroin = ifelse(str_detect(Substance, regex("Heroin", ignore_case = T)), "Yes", "No"))
+df <- df %>% mutate(Fentanyl = ifelse(str_detect(Substance, regex("Fentanyl", ignore_case = T)), "Yes", "No"))
+df <- df %>% mutate(Sedatives = ifelse(str_detect(Substance, regex("Sedatives", ignore_case = T)), "Yes", "No"))
+df$Substance2 <- df$Substance
+
+df <- df %>% mutate(Died = ifelse(str_detect(paste(COMENTARIOS, EFECTO_SECUNDARIO), regex("Fallec", ignore_case = T)), "Yes", "No"))
+
+#Who entered
+df <- df %>% mutate(`Cruz Roja` = ifelse(str_detect(paste(COMENTARIOS, EFECTO_SECUNDARIO), 
+                                                    regex(paste("Cruz", "cr", sep = "|"), ignore_case = T)), "Yes", "No"))
+df <- df %>% mutate(`Attended` = case_when(FOLIO == "sa031280" ~ "Verter",
+                                        FOLIO == "lu110278" ~ "Verter",
+                                        FOLIO == "jo061091" ~ "Verter",
+                                        FOLIO == "pa201296" ~ "Verter",
+                                        FOLIO == "SA031280" ~ "Verter",
+                                        FOLIO == "LU110278" ~ "Verter",
+                                        FOLIO == "JO061091" ~ "Verter",
+                                        FOLIO == "PA201296" ~ "Verter",
+                                        `Cruz Roja` == "Yes" ~ "Cruz Roja",
+                                        TRUE ~ "Other"
+))
+
+#Clean up reanimation techniques
+df <- df %>% rename(`Emergency services called` = SERVICIOS_EMERGENCIA, `CPR performed` = `T.âCRCP`, 
+                    `Mouth-to-mouth` = `T.âCRBB`, `Hit trachea` = `T.âCGTE`, `Water and salt` = `T.âCAS`, 
+                    `Physical stimulation` = `T.âCG`, `Ice in neck or groin` = `T.âCHCT`)
+df <- df %>% mutate(across(.cols = c(`CPR performed`, `Mouth-to-mouth`,
+              `Hit trachea`, `Water and salt`, `Physical stimulation`, `Ice in neck or groin`), 
+              ~case_when(.x == "No" ~ "No", 
+                         .x == "Si" ~ "Yes",
+                         .x == "Sí" ~ "Yes")))
+df <- df %>% mutate(`Emergency services called-Yes/No` = case_when(
+  `Emergency services called` == "No fue necesario" ~ "No",
+  `Emergency services called` == "No hacen caso" ~ "No",
+  `Emergency services called` == "No sabíamos" ~ "No",
+  `Emergency services called` == "No teníamos como llamarles" ~ "No",
+  `Emergency services called` == "No, pero llegaron" ~ "No",
+  `Emergency services called` == "No, por miedo a la autoridad" ~ "No",
+  `Emergency services called` == "Prefiero no responder" ~ "Did not respond",
+  `Emergency services called` == "Sí, pero no llegaron" ~ "Yes",
+  `Emergency services called` == "Sí, se llamó y llegaron" ~ "Yes", 
+  `Emergency services called` == "Sin respuesta" ~ "Did not respond"    
+))
+
+df <- df %>% mutate(`Emergency services not called - Reasons` = case_when(
+  `Emergency services called` == "No fue necesario" ~ "Not necessary",
+  `Emergency services called` == "No hacen caso" ~ "Did not respond",
+  `Emergency services called` == "No sabíamos" ~ "Did not know",
+  `Emergency services called` == "No teníamos como llamarles" ~ "Did not have a way to call",
+  `Emergency services called` == "No, pero llegaron" ~ "No, but they arrived anyway",
+  `Emergency services called` == "No, por miedo a la autoridad" ~ "No, for fear of the authority",
+))
+
+#Filter study period
+df <- df %>% filter(FECHA > ymd("2019-5-31") & FECHA < ymd("2021-6-1"))
+```
+
+```{r}
+#Time series set up
+df <- df %>% mutate(Month = month(FECHA_INCIDENTE))
+df <- df %>% mutate(Year = year(FECHA_INCIDENTE))
+df.time.series <- df %>% group_by(Year, Month) %>% tally()
+df.time.series <- df.time.series %>% mutate(FECHA_INCIDENTE = ymd(paste(Year, Month, 15, sep = "-")))
+df.time.series <- df.time.series %>% mutate(Period = case_when(
+  FECHA_INCIDENTE >= ymd("2019-3-1") & FECHA_INCIDENTE <= ymd("2019-6-1") ~ "Before pandemic - quarter 1",
+  FECHA_INCIDENTE >= ymd("2019-6-1") & FECHA_INCIDENTE <= ymd("2019-9-1") ~ "Before pandemic - quarter 2",
+  FECHA_INCIDENTE >= ymd("2019-9-1") & FECHA_INCIDENTE <= ymd("2019-12-1") ~ "Before pandemic - quarter 3",
+  FECHA_INCIDENTE >= ymd("2019-12-1") & FECHA_INCIDENTE <= ymd("2020-3-1") ~ "Before pandemic - quarter 4",
+  FECHA_INCIDENTE >= ymd("2020-3-1") & FECHA_INCIDENTE <= ymd("2020-6-1") ~ "During pandemic - quarter 1",
+  FECHA_INCIDENTE >= ymd("2020-6-1") & FECHA_INCIDENTE <= ymd("2020-9-1") ~ "During pandemic - quarter 2",
+  FECHA_INCIDENTE >= ymd("2020-9-1") & FECHA_INCIDENTE <= ymd("2020-12-1") ~ "During pandemic - quarter 3",
+  FECHA_INCIDENTE >= ymd("2020-9-1") & FECHA_INCIDENTE <= ymd("2021-3-1") ~ "During pandemic - quarter 4"
+))
+df.time.series <- df.time.series %>% mutate(Period2 = word(Period, 1, sep = "\\-"))
+df.time.series.q <- df.time.series %>% group_by(Period) %>% summarise(Count = sum(n)) %>% mutate(Q.n = row_number())
+df.time.series.q %>% filter(!is.na(Period)) %>% 
+  mutate(pct_change = (Count/lag(Count) - 1) * 100)
+df.time.series.q <- df.time.series.q %>% mutate(Period2 = word(Period, 1, sep = "\\-"))
+df.time.series.q %>% filter(!Period %in% c("Before pandemic - quarter 1", "During pandemic - quarter 4")) %>% group_by(Period2) %>% summarise(Count = sum(Count)) %>% mutate(pct_change = (Count/lag(Count) - 1) * 100)
+df.time.series.q %>% filter(!Period %in% c("Before pandemic - quarter 1", "During pandemic - quarter 4")) %>% group_by(Period2) %>% summarise(Count = sum(Count)) %>% mutate(pct_change = (Count/lag(Count) - 1) * 100)
+
+#Fentanyl
+df %>% group_by(Fentanyl) %>% summarise(median(`Naloxone doses`, na.rm = T))
+df.time.series.f <- df %>% group_by(Year, Month) %>% filter(Fentanyl == "Yes") %>% tally()
+df.time.series.f <- df.time.series.f %>% mutate(FECHA_INCIDENTE = ymd(paste(Year, Month, 15, sep = "-")))
+df.time.series.f <- df.time.series.f %>% mutate(Period = case_when(
+  FECHA_INCIDENTE >= ymd("2019-3-1") & FECHA_INCIDENTE <= ymd("2019-6-1") ~ "Before pandemic - quarter 1",
+  FECHA_INCIDENTE >= ymd("2019-6-1") & FECHA_INCIDENTE <= ymd("2019-9-1") ~ "Before pandemic - quarter 2",
+  FECHA_INCIDENTE >= ymd("2019-9-1") & FECHA_INCIDENTE <= ymd("2019-12-1") ~ "Before pandemic - quarter 3",
+  FECHA_INCIDENTE >= ymd("2019-12-1") & FECHA_INCIDENTE <= ymd("2020-3-1") ~ "Before pandemic - quarter 4",
+  FECHA_INCIDENTE >= ymd("2020-3-1") & FECHA_INCIDENTE <= ymd("2020-6-1") ~ "During pandemic - quarter 1",
+  FECHA_INCIDENTE >= ymd("2020-6-1") & FECHA_INCIDENTE <= ymd("2020-9-1") ~ "During pandemic - quarter 2",
+  FECHA_INCIDENTE >= ymd("2020-9-1") & FECHA_INCIDENTE <= ymd("2020-12-1") ~ "During pandemic - quarter 3",
+  FECHA_INCIDENTE >= ymd("2020-9-1") & FECHA_INCIDENTE <= ymd("2021-3-1") ~ "During pandemic - quarter 4"
+))
+df.time.series.fq <- df.time.series.f %>% group_by(Period) %>% summarise(Count = sum(n)) %>% mutate(Q.n = row_number())
+df.time.series.fq %>% filter(!is.na(Period)) %>% mutate(pct_change = (Count/lag(Count) - 1) * 100)
+df.time.series.q <- df.time.series.q %>% mutate(Period2 = word(Period, 1, sep = "\\-"))
+df.time.series.q %>% group_by(Period2) %>% summarise(Count = sum(Count))
+
+#Naloxona time series
+df.naloxona <- read_excel("ENTREGA DE NALOXONA_210623.xlsx")
+df.naloxona <- df.naloxona %>% filter(`Fecha de entrega` > ymd("2019-5-31") & `Fecha de entrega` < ymd("2021-6-1"))
+df.naloxona$`Cantidad de NALOXONA entregada` <- replace_na(df.naloxona$`Cantidad de NALOXONA entregada`, 0)
+df.naloxona$`Cantidad de NARCAN entregada` <- replace_na(df.naloxona$`Cantidad de NARCAN entregada`, 0)
+df.naloxona <- df.naloxona %>% dplyr::select(`Fecha de entrega`, Naloxona = `Cantidad de NALOXONA entregada`,
+                                             Narcan = `Cantidad de NARCAN entregada`) %>% filter(!is.na(`Fecha de entrega`))
+df.naloxona %>% summarise(Naloxona = sum(`Naloxona`, na.rm = T), 
+                          Narcan = sum(`Narcan`, na.rm = T))
+df.naloxona <- df.naloxona %>% mutate(Y = Naloxona + Narcan)
+df.naloxona <- df.naloxona %>% mutate(Month = month(`Fecha de entrega`), Year = year(`Fecha de entrega`)) %>%
+  mutate(`Month - Year` = format(`Fecha de entrega`, "%Y-%m")) %>% mutate(Fecha2 = ymd(paste0(`Month - Year`," - 15")))
+df.naloxona <- df.naloxona %>% mutate(Y = Naloxona + Narcan)
+df.naloxona.month <- df.naloxona %>% group_by(Fecha2) %>% 
+  summarise(Narcan = sum(Narcan), Naloxona = sum(Naloxona), Y = sum(Y))
+
+df.naloxona2 <- uncount(df.naloxona, Narcan) %>% mutate(`Naloxone dispensed` = "Intranasal")
+df.naloxona3 <- uncount(df.naloxona, Naloxona) %>% mutate(`Naloxone dispensed` = "Injectable")
+df.naloxona.long <- bind_rows(df.naloxona2, df.naloxona3)
+
+#Poison test
+poisson.test(c(165, 127), c(9, 9), alternative = c("two.sided"))
+
+```
+
+```{r}
+#Make tables
+## Get variables names
+#dput(names(df))
+#Order factors by frequency
+df <- df %>% mutate(across(where(is.factor), ~fct_infreq(.x)))
+df <- df %>% mutate(across(.cols = c(COLONIAS, `Product applied`, Substance), ~fct_infreq(as.factor(.x))))
+df <- df %>% mutate(across(.cols = c(`Emergency services called-Yes/No`, `Emergency services not called - Reasons`, 
+                                     `CPR performed`, `Mouth-to-mouth`, `Hit trachea`, `Water and salt`, `Physical stimulation`, 
+                                     `Ice in neck or groin`), ~fct_infreq(as.factor(.x))))
+
+myVars <- c("Age", "Gender", 
+            "Naloxone applied", "Naloxone doses", "Product applied",
+            "Substance", "Heroin", "Sedatives", "Methamphetamine", "Fentanyl", 
+            "Died"
+)
+catVars <- c("Gender", "Product applied", "Substance")
+
+#General table
+tab1 <- CreateTableOne(data = df, vars = myVars, factorVars = catVars, includeNA = T)
+df.table1 <- data.frame(print(tab1, nonnormal = "Naloxone doses", formatOptions = list(big.mark = ",")), check.rows=FALSE) %>%
+    add_rownames("Name")
+
+#Geography table
+tab2 <- CreateTableOne(data = df, vars = c("LUGAR_SOBREDOSIS", "COLONIAS"), includeNA = T)
+df.table2 <- data.frame(print(tab2, noSpaces = TRUE),  check.names = FALSE) %>% add_rownames("Name")
+
+#Fentanyl table
+tab.fentanyl <- CreateTableOne(data = df, vars = c("Naloxone doses"), strata = "Fentanyl")
+df.fentanyl <- data.frame(print(tab.fentanyl, nonnormal = "Naloxone doses", formatOptions = list(big.mark = ",")), check.names=FALSE) %>%
+    add_rownames("Name")
+
+#Table for EMS and resucitation 
+tab3 <- CreateTableOne(data = df, 
+                       vars = c("Emergency services called-Yes/No", "Emergency services not called - Reasons", 
+                                "CPR performed", "Mouth-to-mouth","Hit trachea", 
+                                "Water and salt", "Physical stimulation", "Ice in neck or groin"), includeNA = T)
+df.table3 <- as.data.frame(print(tab3, formatOptions = list(big.mark = ",")), check.rows=FALSE) %>%
+    rownames_to_column("Name")
+```
+
+```{r}
+#Create word documents with tables
+#For word
+ft.1 <- flextable(df.table1,
+          col_keys = c("Name", "Overall")) %>%
+  set_header_labels(rowname = "Name", Overall = "Overall") %>%
+  set_caption(caption =  "Table 1. Descriptive statistics") %>%
+  autofit() %>% theme_zebra(odd_header = "transparent", even_header = "transparent")
+ft.1  
+
+ft.2 <- flextable(df.table2,
+          col_keys = c("Name", "Overall")) %>%
+  set_header_labels(rowname = "Name", Overall = "Overall") %>%
+  set_caption(caption =  "Table 2. Geography") %>%
+  autofit() %>% theme_zebra(odd_header = "transparent", even_header = "transparent")
+ft.2  
+
+ft.3 <- flextable(df.table3,
+          col_keys = c("Name", "Overall")) %>%
+  set_header_labels(rowname = "Name", Overall = "Overall") %>%
+  set_caption(caption =  "Table 3. Emergency Services") %>%
+  autofit() %>% theme_zebra(odd_header = "transparent", even_header = "transparent")
+ft.3  
+
+tab1.list <- list(ft.1, ft.2, ft.3)
+
+# write function
+write_word_table <- function(var, doc){
+  doc %>%
+    body_add_flextable(var) %>% 
+    body_add_break() }
+
+# list of tables and the doc
+my_doc1 <- officer::read_docx()
+
+# use walk (the invisible function of map) to include all tables in one doc
+walk(tab1.list, write_word_table, my_doc1) 
+print(my_doc1, target = "Doc1.docx") %>% invisible()
+
+```
+
+```{r}
+#Naloxone distribution plot over time
+p.naloxone <- ggplot(data = df.naloxona.long, aes(x = as.Date(`Fecha de entrega`))) +
+  geom_histogram(aes(fill = `Naloxone dispensed`)) +
+  scale_fill_discrete_sequential(name = "Naloxone dispensed", palette = "Sunset") +
+  scale_x_date(limits = c(as.Date("2019-06-01"), as.Date("2021-06-01")),
+               date_labels = "%B\n%Y",
+               breaks = c(as.Date("2019-06-01"), as.Date("2020-03-01"), as.Date("2021-05-01"))) +
+  geom_hline(yintercept=seq(1, 115, by = 5), linetype="solid", color = "white", size=0.1)+
+  geom_vline(xintercept = as.Date("2020-03-15"), color = "red", linetype = "dashed") +
+  geom_text(aes(x = as.Date("2020-04-15"), y = 90, label = "COVID-19\nPandemic\nDeclared"),                  
+           size = 4, angle = 0, hjust = 0) +
+  scale_y_continuous(name = "Number of naloxone dispensed",  position = "left") +
+  labs(x = "") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) +
+  theme(axis.title.y = element_text(angle = 90, vjust = 0.5, hjust = 0.5),
+        axis.text.y = element_text(angle = 0)) + 
+  theme(axis.title.y = element_text(margin = margin(t = 0, r = 10, b = 0, l = 20))) +
+  theme(plot.margin = margin(25, 25, 10, 25))  + 
+  theme(legend.justification = "left",
+        legend.position = "right",
+        legend.text = element_text(size=10)) +
+  theme(text = element_text(size = 14))
+p.naloxone
+p.naloxone.legened <- get_legend(p.naloxone)
+
+```
+
+```{r}
+#Overdose plot over time
+p.mxl.histo <- ggplot(data = df, aes(x = FECHA_INCIDENTE)) +
+  geom_histogram(aes(fill = Substance3), color = "grey95") +
+  scale_fill_discrete_sequential(name = "Substance", palette = "Viridis") +
+  scale_x_date(limits = c(as.Date("2019-06-01"), as.Date("2021-06-01")),
+               date_labels = "%B\n%Y",
+               breaks = c(as.Date("2019-06-01"), as.Date("2020-03-01"), as.Date("2021-05-01"))) +
+  geom_vline(xintercept = as.Date("2020-03-15"), color = "red", linetype = "dashed") +
+  geom_text(aes(x = as.Date("2020-04-15"), y = 35, label = "COVID-19\nPandemic\nDeclared"),                  
+           size = 4, angle = 0, hjust = 0) +
+  scale_y_continuous(name = "Overdoses",  position = "left") +
+  labs(x = "") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) +
+  theme(axis.title.y = element_text(angle = 90, vjust = 0.5, hjust = 0.5),
+        axis.text.y = element_text(angle = 0)) + 
+  theme(axis.title.y = element_text(margin = margin(t = 0, r = 10, b = 0, l = 20))) +
+  theme(plot.margin = margin(25, 25, 10, 25))  + 
+  theme(legend.justification = "left",
+        legend.position = "right",
+        legend.text = element_text(size=9)) +
+  theme(text = element_text(size = 14)) +
+  guides(fill = guide_legend(ncol = 2)) 
+
+p.mxl.histo
+p.mxl.histo.legend <- get_legend(p.mxl.histo)
+```
+
+```{r Set up map}
+#Create random dots for each overdose
+#mxl.shp <- st_read("/Users/davigood/Box/UCLA/2019_SIF/Sobredosis/Colonias/Colonias.shp")
+#mxl.shp <- mxl.shp %>% filter(MUN_NAME == "MEXICALI")
+p_load(furrr)
+plan(multisession)
+
+#Join df to shp file
+mxl.shp <- mxl.shp %>% left_join(df.sum, by = "COLONIAS")
+
+#Create points for overdoses
+mxl.shp$n <- replace_na(mxl.shp$n, 0)
+mxl.split <- mxl.shp %>% 
+  split(list(.$n)) 
+
+generate_samples <- function(data) 
+    suppressMessages(st_sample(data, size = round(data$n)))
+
+points.mxl <- future_map(mxl.split, generate_samples, .progress = TRUE) #Long time
+points.mxl <- imap(points.mxl, 
+               ~st_sf(data_frame(variable = rep(.y, length(.x))),
+                      geometry = .x))
+points.mxl <- do.call(rbind, points.mxl)
+
+
+ggplot() + 
+    geom_sf(data = points.mxl,
+            size = .1)
+```
+
+```{r}
+#Import data for maps
+df.verter <- data.frame(y = c(32.662253190635255), x = c(-115.49382001533995), label = c("VERTER"))
+us.border <- read.csv("us_border.csv")
+mex.border <- read.csv("municipios_geo.csv")
+us.border <- us.border %>% mutate(lat = case_when(City == "Calexico, California" ~ 32.69,
+                                                  TRUE ~ lat))
+us.border <- us.border %>% mutate(lon = case_when(City == "Calexico, California" ~ -115.34,
+                                                  TRUE ~ lon))
+mex.border <- mex.border %>% mutate(lat = case_when(municipios == " Mexicali, Baja California" ~ 32.64,
+                                                  TRUE ~ lat))
+mex.border <- mex.border %>% mutate(lon = case_when(municipios == " Mexicali, Baja California" ~ -115.34,
+                                                  TRUE ~ lon))
+```
+
+```{r}
+#Create maps
+p.mxl <- ggplot() +
+  geom_sf(data = mxl.shp, fill = "grey99", color = "grey50", size = 0.1, alpha = 0.5) +
+  geom_path(data = US.mex.border, aes(x = long, y = lat, colour = "International border"), size = 1, alpha = 1) +
+  scale_color_manual(name = "", values = "blue") +
+  geom_sf(data = points.mxl, aes(shape = "Overdoses"), 
+          size = 0.8, stroke = 0.1, fill = "red", color = "black", alpha = 1) +
+  scale_shape_manual(name = "", values = 21) +
+  new_scale_fill() +
+  geom_point(data = df.verter, aes(y = y, x = x, fill = "Verter"), 
+             shape = 24, size = 3, stroke = 0.5, color = "black", inherit.aes = F) + 
+  scale_fill_manual(name = "", values = "forest green") + 
+  coord_sf(xlim = c(-115.6, -115.3), ylim  = c(32.55, 32.7)) +
+  annotation_scale() +
+  theme_void() + 
+  theme(plot.margin = margin(25, 25, 10, 25)) + 
+  theme(legend.justification = "left", legend.text = element_text(size = 12)) +
+  guides(shape = guide_legend(override.aes = list(size = 3, fill = "red", color = "black") ) )
+p.mxl
+
+
+p.mxl.box <- p.mxl + 
+  geom_label(data = mex.border, aes(x = lon, y = lat, label = municipios2)) + 
+  geom_label(data = us.border, aes(x = lon, y = lat, label = City2), 
+             fill = "white", colour="black") +
+  geom_rect(aes(xmax = -115.55, xmin = -115.45, ymin = 32.62, ymax = 32.68),
+            fill = NA, colour = "black", size = 0.5) +
+   theme_void() 
+p.mxl.box
+
+p.mxl.zoom <- p.mxl +
+  coord_sf(xlim = c(-115.55, -115.45), ylim  = c(32.62, 32.68)) +
+  ggforce::geom_mark_ellipse(data = df.verter, aes(y = y, x = x, label = label),
+                               label.fill = "grey80", alpha = .15, show.legend = FALSE) +
+  annotation_scale() +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) 
+p.mxl.zoom
+
+p.mxl.legend <- get_legend(p.mxl)
+```
+
+```{r}
+#Create figure 1
+cowplot::plot_grid(
+  cowplot::plot_grid(p.mxl.histo + theme(legend.position="none"), p.mxl.histo.legend, 
+            nrow = 1, rel_widths = c(7,3), rel_heights = c(10,5)),
+  cowplot::plot_grid(p.naloxone + theme(legend.position="none"), p.naloxone.legened, 
+            nrow = 1, rel_widths = c(7,3), rel_heights = c(10,5)),
+  cowplot::plot_grid(p.mxl.zoom + theme(legend.position="none"), p.mxl.box + theme(legend.position="none"), p.mxl.legend, 
+            nrow = 1, rel_widths = c(3.5, 3.5, 3)),
+  ncol = 1, rel_heights = c(3, 3, 4),
+  labels = c('A)', 'B)', 'C)')
+)
+
+ggsave("vidas_salvadas_verter.png", dpi = 600, height = 9, width = 10)
+ggsave("vidas_salvadas_verter.tiff", dpi = 300, height = 9, width = 10)
+
+```
+
